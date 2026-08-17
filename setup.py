@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'wake_word_node = nestor_stt.wake_word_node:main',
         ],
     },
 )
