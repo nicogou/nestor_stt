@@ -1,11 +1,10 @@
 import os
 import threading
-import wave
-from datetime import datetime
 from enum import Enum, auto
 
 import numpy as np
 import sounddevice as sd
+from faster_whisper import WhisperModel
 from openwakeword import VAD
 from openwakeword.model import Model
 import rclpy
@@ -30,22 +29,26 @@ class WakeWordNode(Node):
         self.declare_parameter('chunk_size', 1280)
         self.declare_parameter('sample_rate', 16000)
         self.declare_parameter('cooldown_s', 1.0)
-        self.declare_parameter('output_dir', os.path.expanduser('~/nestor_recordings'))
         self.declare_parameter('vad_speech_threshold', 0.5)
         self.declare_parameter('vad_silence_duration_s', 0.8)
         self.declare_parameter('max_utterance_duration_s', 10.0)
+        self.declare_parameter('whisper_model', 'small')
+        self.declare_parameter('whisper_device', 'auto')
+        self.declare_parameter('whisper_compute_type', 'default')
+        self.declare_parameter('language', 'fr')
 
         model_paths = self.get_parameter('model_paths').get_parameter_value().string_array_value
         self._threshold = self.get_parameter('threshold').get_parameter_value().double_value
         self._chunk_size = self.get_parameter('chunk_size').get_parameter_value().integer_value
         self._sample_rate = self.get_parameter('sample_rate').get_parameter_value().integer_value
         cooldown_s = self.get_parameter('cooldown_s').get_parameter_value().double_value
-        self._output_dir = self.get_parameter('output_dir').get_parameter_value().string_value
         self._vad_threshold = self.get_parameter('vad_speech_threshold').get_parameter_value().double_value
         vad_silence_s = self.get_parameter('vad_silence_duration_s').get_parameter_value().double_value
         max_utt_s = self.get_parameter('max_utterance_duration_s').get_parameter_value().double_value
-
-        os.makedirs(self._output_dir, exist_ok=True)
+        whisper_model = self.get_parameter('whisper_model').get_parameter_value().string_value
+        whisper_device = self.get_parameter('whisper_device').get_parameter_value().string_value
+        whisper_compute_type = self.get_parameter('whisper_compute_type').get_parameter_value().string_value
+        self._language = self.get_parameter('language').get_parameter_value().string_value
 
         valid_paths = [p for p in model_paths if p]
         if valid_paths:
@@ -56,6 +59,9 @@ class WakeWordNode(Node):
             self._oww = Model()
 
         self._vad = VAD()
+
+        self.get_logger().info(f'Loading Whisper model: {whisper_model}')
+        self._whisper = WhisperModel(whisper_model, device=whisper_device, compute_type=whisper_compute_type)
 
         self._cooldown_ticks = int(cooldown_s * self._sample_rate / self._chunk_size)
         self._cooldown_remaining: dict[str, int] = {}
@@ -74,7 +80,7 @@ class WakeWordNode(Node):
         self._vad_carry: np.ndarray = np.empty(0, dtype=np.int16)
 
         self._wake_pub = self.create_publisher(String, 'stt/wake_word_detected', 10)
-        self._file_pub = self.create_publisher(String, 'stt/utterance_file', 10)
+        self._transcription_pub = self.create_publisher(String, 'stt/transcription', 10)
 
         self._stream = sd.InputStream(
             samplerate=self._sample_rate,
@@ -162,25 +168,31 @@ class WakeWordNode(Node):
         if reason == 'timeout':
             self.get_logger().warn('Max utterance duration reached')
 
-        # Write WAV in a daemon thread to keep the audio callback non-blocking
+        # Transcribe in a daemon thread to keep the audio callback non-blocking
         threading.Thread(
-            target=self._save_wav,
+            target=self._transcribe,
             args=(audio_data,),
             daemon=True,
         ).start()
 
-    def _save_wav(self, audio_data: np.ndarray) -> None:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filepath = os.path.join(self._output_dir, f'utterance_{ts}.wav')
+    def _transcribe(self, audio_data: np.ndarray) -> None:
+        # faster-whisper expects float32 in [-1, 1] at 16 kHz
+        audio_f32 = audio_data.astype(np.float32) / 32768.0
 
-        with wave.open(filepath, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # int16 = 2 bytes
-            wf.setframerate(self._sample_rate)
-            wf.writeframes(audio_data.tobytes())
+        self.get_logger().info('Starting transcription...')
+        segments, _ = self._whisper.transcribe(
+            audio_f32,
+            language=self._language,
+            beam_size=5,
+            without_timestamps=True,
+        )
+        text = ' '.join(seg.text.strip() for seg in segments).strip()
 
-        self.get_logger().info(f'Utterance saved: {filepath}')
-        self._file_pub.publish(String(data=filepath))
+        if text:
+            self.get_logger().info(f'Transcription: "{text}"')
+            self._transcription_pub.publish(String(data=text))
+        else:
+            self.get_logger().warn('Transcription produced empty result')
 
     # ------------------------------------------------------------------
 
