@@ -166,7 +166,8 @@ class WakeWordNode(Node):
         self._state = _State.LISTENING
 
         if reason == 'timeout':
-            self.get_logger().warn('Max utterance duration reached')
+            self.get_logger().warn('Utterance timed out (max duration reached)')
+            return
 
         # Transcribe in a daemon thread to keep the audio callback non-blocking
         threading.Thread(
